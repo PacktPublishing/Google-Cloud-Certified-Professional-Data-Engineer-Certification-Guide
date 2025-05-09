@@ -4,7 +4,7 @@ config {
   assertions: { 
     uniqueKey: ["user_id"], 
     nonNull: ["user_id"], 
-    rowConditions: ["revenue > 0"] 
+    rowConditions: ["revenue > 10"] 
   } 
 } 
  
