@@ -1,0 +1,224 @@
+# main.workflows.yaml
+main:
+  params: [event] # Event from Eventarc trigger (Cloud Storage object creation)
+  steps:
+    - init_variables:
+        assign:
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - location: "us" # Document AI / Cloud Functions region
+          - doc_ai_processor_id: "xxxxxxxxxxxx" # e.g., a pre-trained Expense or Invoice Parser ID
+          - transformation_function_url: "https://receipt-transformation-function-xxxxxxxxx.us-central1.run.app" # For data transformation
+          - bq_dataset_id: "expense_receipts"
+          - bq_table_id: "processed_receipts"
+          - notification_topic: "receipt_notifications" # Pub/Sub topic
+          - gcs_bucket: ${event.data.bucket}
+          - gcs_object: ${event.data.name}
+          - gcs_uri: ${"gs://" + event.data.bucket + "/" + event.data.name}
+          - mime_type: ${event.data.contentType}
+          - user_identifier: "lab_user_test" # Simplified for lab
+          - current_timestamp: ${time.format(sys.now())} # ISO 8601 format for BQ TIMESTAMP
+
+    - process_with_document_ai:
+        try:
+          call: googleapis.documentai.v1.projects.locations.processors.process
+          args:
+            name: ${"projects/" + project_id + "/locations/" + location + "/processors/" + doc_ai_processor_id}
+            body:
+                skipHumanReview: true
+                gcsDocument:
+                  gcsUri: ${gcs_uri}
+                  mimeType: ${mime_type}
+                field_mask: text,entities
+          result: doc_ai_result
+        except:
+          as: e
+          steps:
+            - log_doc_ai_error:
+                call: sys.log
+                args:
+                  text: '${"Document AI processing failed for " + gcs_uri + ". Error: " + e.message}'
+                  severity: "ERROR"
+            - prepare_failure_record_docai:
+                assign:
+                  - bq_row_data:
+                      file_uri: ${gcs_uri}
+                      upload_timestamp: ${current_timestamp}
+                      user_id: ${user_identifier}
+                      processing_status: "FAILURE_DOCAI"
+                      error_message: ${e.message}
+                      # Other fields will be null
+                next: insert_into_bigquery # Attempt to record failure
+        next: transform_data_with_function
+
+    - transform_data_with_function:
+        try:
+          call: http.post
+          args:
+            url: ${transformation_function_url}
+            auth: { type: OIDC }
+            body:
+              document_ai_output: ${doc_ai_result.document}
+              original_file_uri: ${gcs_uri}
+              user_identifier: ${user_identifier}
+          result: transform_result # Expected: { "isValid": true/false, "data_for_bq": {...}, "errors": "..." }
+        except:
+          as: e
+          steps:
+            - log_function_error:
+                call: sys.log
+                args:
+                  text: '${"Data transformation Cloud Function failed for " + gcs_uri + ". Error: " + e.message}'
+                  severity: "ERROR"
+            - prepare_failure_record_function:
+                assign:
+                  - bq_row_data:
+                      file_uri: ${gcs_uri}
+                      upload_timestamp: ${current_timestamp}
+                      user_id: ${user_identifier}
+                      processing_status: "FAILURE_TRANSFORMATION"
+                      error_message: ${e.message}
+                      doc_ai_full_text: ${doc_ai_result.document.text} # Store raw text if function fails
+                next: insert_into_bigquery
+        next: check_transformation_status
+
+    - check_transformation_status:
+        switch:
+          - condition: ${transform_result.body.isValid == true}
+            next: prepare_success_record_for_bq
+        # Default if not valid (isValid == false)
+        next: prepare_validation_failure_record_for_bq
+
+    - prepare_validation_failure_record_for_bq:
+        assign:
+          - bq_row_data:
+              file_uri: ${gcs_uri}
+              upload_timestamp: ${current_timestamp}
+              user_id: ${user_identifier}
+              processing_status: "FAILURE_VALIDATION"
+              error_message: ${base64.encode(json.encode(transform_result.body.errors))}
+              doc_ai_full_text: ${transform_result.body.data_for_bq.doc_ai_full_text} # If function provided it
+              vendor_name: ${transform_result.body.data_for_bq.vendor_name}
+              total_amount: ${transform_result.body.data_for_bq.total_amount}
+              invoice_date: ${transform_result.body.data_for_bq.invoice_date}
+        next: insert_into_bigquery
+
+    - prepare_success_record_for_bq:
+        assign:
+          - bq_row_data:
+              file_uri: ${gcs_uri}
+              upload_timestamp: ${current_timestamp}
+              user_id: ${user_identifier}
+              processing_status: "SUCCESS"
+              doc_ai_full_text: ${transform_result.body.data_for_bq.doc_ai_full_text}
+              vendor_name: ${transform_result.body.data_for_bq.vendor_name}
+              total_amount: ${transform_result.body.data_for_bq.total_amount}
+              invoice_date: ${transform_result.body.data_for_bq.invoice_date}
+              # Add any other fields returned by your function
+        next: insert_into_bigquery
+
+    - insert_into_bigquery:
+        try:
+          call: googleapis.bigquery.v2.tabledata.insertAll # Simpler for single rows too
+          args:
+            projectId: ${project_id}
+            datasetId: ${bq_dataset_id}
+            tableId: ${bq_table_id}
+            body:
+              rows:
+                - json: ${bq_row_data} # bq_row_data should be a map of column_name: value
+              # skipInvalidRows: false # Default, fail if row is invalid
+              # ignoreUnknownValues: false # Default, fail on unknown columns
+          result: bq_insert_result
+        except:
+          as: e
+          steps:
+            - log_bq_error:
+                call: sys.log
+                args:
+                  text: '${"BigQuery insert failed for " + gcs_uri + ". Error: " + e.message + ". Data: " + base64.encode(json.encode(bq_row_data))}'
+                  severity: "CRITICAL"
+            # At this point, data might be lost for this run if BQ fails.
+            # For a lab, we might just end. For production, consider a dead-letter queue.
+            - publish_critical_failure_notification:
+                call: publish_to_pubsub
+                args:
+                  topic_name: ${notification_topic}
+                  message_data:
+                    status: "CRITICAL_FAILURE"
+                    reason: "BigQuery insert failed."
+                    file: ${gcs_uri}
+                    error: ${e.message}
+                next: end_workflow_failure
+        next: check_bq_insert_errors
+
+    - check_bq_insert_errors:
+        # The insertAll API can have per-row errors even if the call itself doesn't throw an exception
+        # For a single row insert, bq_insert_result.insertErrors will likely be empty on success
+        # or contain an error if the row schema was bad but the API call was accepted.
+        switch: 
+            - condition: ${"insertErrors" in bq_insert_result}
+              steps:
+                - log_bq_insert_row_error:
+                    call: sys.log
+                    args:
+                      text: '${"BigQuery row insert error for " + gcs_uri + ". Error: " + base64.encode(json.encode(bq_insert_result.insertErrors))}'
+                      severity: "ERROR"
+                - publish_failure_notification_bq_row:
+                    call: publish_to_pubsub
+                    args:
+                      topic_name: ${notification_topic}
+                      message_data:
+                        status: "FAILURE"
+                        reason: "BigQuery row insert error."
+                        file: ${gcs_uri}
+                        bq_errors: ${bq_insert_result.insertErrors}
+                    next: end_workflow_failure
+        next: publish_final_notification
+
+    - publish_final_notification:
+        call: publish_to_pubsub
+        args:
+          topic_name: ${notification_topic}
+          message_data:
+            status: ${bq_row_data.processing_status} # "SUCCESS" or "FAILURE_..."
+            message: ${"Receipt processing finished for " + gcs_uri}
+            file: ${gcs_uri}
+            user: ${user_identifier}
+            bq_destination: ${"projects/" + project_id + "/datasets/" + bq_dataset_id + "/tables/" + bq_table_id}
+        next: end_workflow_success # Even if it was a handled failure, workflow itself succeeded
+
+    - end_workflow_success:
+        return: "Workflow completed."
+    - end_workflow_failure:
+        return: "Workflow completed with errors."
+
+# Helper sub-workflow for publishing to Pub/Sub (same as before)
+publish_to_pubsub:
+  params: [topic_name, message_data]
+  steps:
+    - init_pubsub_vars:
+        assign:
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+    - convert_message_to_json_string:
+        assign:
+          - encoded_message_data: ${base64.encode(json.encode(message_data))} # This is the base64 encoded string for Pub/Sub
+
+    - try_publish:
+        try:
+          call: googleapis.pubsub.v1.projects.topics.publish
+          args:
+            topic: ${"projects/" + project_id + "/topics/" + topic_name}
+            body:
+              messages:
+                - data: ${encoded_message_data}
+          result: pubsub_publish_result
+        except:
+          as: e
+          steps:
+            - log_pubsub_error:
+                call: sys.log
+                args:
+                  text: '${"Failed to publish to Pub/Sub topic " + topic_name + ". Error: " + e.message}'
+                  severity: "ERROR"
+    - return_from_publish:
+        return: ${pubsub_publish_result}
